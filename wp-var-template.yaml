@@ -1,0 +1,293 @@
+- hosts: allnode
+  remote_user: student
+  become: yes
+  tasks:
+  - name: Install epel-release
+    yum: 
+      name: epel-release 
+      state: latest
+  - name: Install libsemanage-python for seboolean
+    yum: 
+      name: libsemanage-python 
+      state: latest
+
+- hosts: haproxyserver
+  remote_user: student
+  become: yes
+  vars:
+    template:
+      haproxy_path: /home/student/playbook/templates/haproxy.cfg.j2
+    haproxy:
+      conf_path: /etc/haproxy/haproxy.cfg
+      frontend:
+        port: 80
+      backend:
+        name: wp
+        balance_type: roundrobin
+        web1:
+          port: 80
+        web2:
+          port: 80
+  tasks:
+  - name: Install haproxy
+    yum:
+      name: haproxy
+      state: latest
+  - name: Open port 80
+    firewalld: 
+      service: http 
+      permanent: yes 
+      state: enabled 
+      immediate: yes    
+  - name: Active seboolean for httpd  
+    seboolean: 
+      name: haproxy_connect_any
+      state: yes 
+      persistent: yes
+  - name: set public_ip on haproxy.cnf
+    set_fact:
+      node1_public_ip: "{{ ansible_eth0.ipv4.address }}"
+  - name: setup webserver1 to allocate ip
+    setup:
+    delegate_to: node2 # ansible_eth1.ipv4.address
+  - name: set node2 ip on haproxy.cnf
+    set_fact:
+      node2_ip: "{{ ansible_eth1.ipv4.address }}"
+  - name: setup webserver2 to allocate ip
+    setup:
+    delegate_to: node3
+  - name: set node3 ip on haproxy.cnf
+    set_fact:
+      node3_ip: "{{ ansible_eth1.ipv4.address }}"
+  - template:
+      src: "{{ template['haproxy_path' }}"
+      dest: "{{ haproxy['conf_path'] }}"
+  - name: start haproxy service
+    service:
+      name: haproxy
+      enabled: true
+      state: started
+
+- hosts: nfsserver
+  remote_user: student
+  become: yes
+  vars:
+    template:
+      exports_path: /home/student/playbook/templates/exports.j2
+      wp-config_path: /home/student/playbook/templates/wp-config.php.j2
+    webserver_iprange: 192.168.123.0
+    webserver_prefix: 24
+    mount:
+      nfs_mountpoint: /wordpressdir
+      webserver_mountpoint: /var/www/html
+    partition:
+      device: /dev/vdb
+      part_number: 1
+      size: 5GiB
+    nfs:
+      conf_path: /etc/exports
+      nfs_option: rw,sync,no_root_squash
+    wordpress:
+      db_name: wordpress_db
+      db_user: admin
+      db_password: dkagh1.        
+  tasks:
+  - name: install nfs-utils
+    yum:
+      name: nfs-utils
+      state: latest
+  - name: Create a directory for nfs service
+    file:
+      path: "{{ mount['nfs_mountpoint'] }}"
+      state: directory
+      mode: '0775'
+  - name: Create a new primary partition for LVM
+    parted:
+      device: "{{ partition['device'] }}"
+      number: "{{ partition['part_number'] }}"
+      flags: [ lvm ]
+      state: present
+      part_start: "{{ partition['size'] }}"
+  - name: Create a ext4 fs on /dev/vdb1 
+    filesystem:
+      fstype: ext4
+      dev: "{{ partition['device'] }}""{{ partition['part_number'] }}"
+  - name: mount /dev/vdb1 on /wordpressdir
+    mount:
+      path: "{{ mount['nfs_mountpoint'] }}"
+      src: "{{ partition['device'] }}""{{ partition['part_number'] }}"
+      fstype: ext4
+      state: mounted
+  - template:
+      src: "{{ template['exports_path' }}"
+      dest: "{{ nfs['conf_path'] }}"
+  - name: Download wordpress
+    get_url: 
+      url: https://ko.wordpress.org/wordpress-5.3.4-ko_KR.tar.gz
+      dest: /tmp/wordpress-5.3.4-ko_KR.tar.gz
+  - name: Unarchive wordpress arch
+    unarchive: 
+      src: /tmp/wordpress-5.3.4-ko_KR.tar.gz 
+      dest: "{{ mount['nfs_mountpoint'] }}" 
+      remote_src: yes 
+      owner: root 
+      group: root
+  - name: template wp-config.php
+    template:
+      src: "{{ template['wp-config_path'] }}"
+      dest: "{{ mount['webserver_mountpoint'] }}"/wordpress/wp-config.php
+  - name: start nfs service
+    service:
+      name: nfs
+      enabled: true
+      state: started
+  - name: allow port for nfs
+    firewalld:
+      service: nfs
+      permanent: yes
+      state: enabled
+      immediate: yes
+  - name: allow port for rpc-bind
+    firewalld:
+      service: rpc-bind
+      permanent: yes
+      state: enabled
+      immediate: yes
+  - name: allow port for mountd
+    firewalld:
+      service: mountd
+      permanent: yes
+      state: enabled
+      immediate: yes
+
+- hosts: database
+  remote_user: student
+  become: yes
+  tasks:
+  - name: Add yum_repository for mariadb
+    yum_repository: 
+      name: MariaDB 
+      baseurl: http://mirror.yongbok.net/mariadb/yum/10.5/centos7-amd64
+      gpgkey: http://mirror.yongbok.net/mariadb/yum/RPM-GPG-KEY-MariaDB 
+      gpgcheck: 1 
+      description: MariaDB
+  - name: Install mariadb
+    yum: 
+      name: MariaDB-server 
+      enablerepo: MariaDB 
+      state: latest
+  - name: Limit accessible hosts and Set port for db
+    lineinfile:
+      path: /etc/my.cnf.d/server.cnf
+      insertafter: '\[mysqld\]'
+      line: 'bind-address=192.168.123.54'
+  - name: Start mariadb
+    service: 
+      name: mariadb 
+      state: started 
+      enabled: true
+  - name: Install library for DB
+    yum: 
+      name: MySQL-python 
+      state: latest
+  - name: Set root password
+    mysql_user: 
+      login_user: root 
+      login_password: '' 
+      user: root 
+      password: dkagh1. 
+      state: present
+  - name: Delete anonymous user in DB
+    mysql_user: 
+      login_user: root 
+      login_password: dkagh1. 
+      name: '' 
+      host_all: yes 
+      state: absent
+  - name: Delete test db in DB
+    mysql_db: 
+      login_user: root 
+      login_password: dkagh1. 
+      db: test 
+      state: absent
+  - name: Create DB for wordpress
+    mysql_db: 
+      login_user: root 
+      login_password: dkagh1. 
+      name: wordpress_db 
+      state: present
+  - name: Create User for wordpress
+    mysql_user: 
+      login_user: root 
+      login_password: dkagh1. 
+      name: admin 
+      password: dkagh1. 
+      priv: wordpress_db.*:ALL,GRANT 
+      host: '192.168.123.%' 
+      state: present
+  - name: Open port 3306 
+    firewalld: 
+      service: mysql 
+      permanent: yes 
+      state: enabled 
+      immediate: yes
+  - name: Active seboolean for mysql
+    seboolean: 
+      name: mysql_connect_any 
+      state: yes 
+      persistent: yes
+
+- hosts: webserver
+  remote_user: student
+  become: yes
+  tasks:
+  - name: Install nfs-utils for mount
+    yum:
+      name: nfs-utils
+      state: latest
+  - name: mount /wordpressdir on /var/www/html
+    mount:
+      path: /var/www/html
+      src: 192.168.123.54:/wordpressdir
+      fstype: nfs
+      state: mounted
+  - name: Install httpd
+    yum: 
+      name: httpd 
+      state: latest
+  - name: Open port 80
+    firewalld: 
+      service: http 
+      permanent: yes 
+      state: enabled 
+      immediate: yes
+  - name: Active seboolean for httpd
+    seboolean:
+      name: httpd_can_network_connect
+      state: yes
+      persistent: yes
+  - name: Active seboolean for httpd  
+    seboolean: 
+      name: httpd_can_network_connect_db 
+      state: yes 
+      persistent: yes
+  - name: Active seboolean for nfs  
+    seboolean: 
+      name: httpd_use_nfs
+      state: yes 
+      persistent: yes
+  - name: Install remi-release-7 for php74
+    yum: 
+      name: https://rpms.remirepo.net/enterprise/remi-release-7.rpm 
+      state: latest
+  - name: Install php and php-mysql 
+    yum: 
+      name: php,php-mysql 
+      enablerepo: remi-php74 
+      state: latest
+  - name: Start httpd
+    service: 
+      name: httpd 
+      state: started 
+      enabled: true
+
